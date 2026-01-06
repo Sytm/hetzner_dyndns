@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"os"
 	"slices"
@@ -15,45 +17,28 @@ type DynDnsConfig struct {
 	ZoneName      string
 	RecordName    string
 	RecordTTL     int
-	RecordType    string
+	A             RecordConfig
+	AAAA          RecordConfig
+}
+
+type RecordConfig struct {
+	Enabled bool
+	Source  string
 }
 
 func main() {
 	if len(os.Args) < 2 {
-		_, _ = os.Stderr.WriteString("config file not provided\n")
+		fmt.Println("config file not provided")
 		return
 	}
-	fmt.Printf("Reading config at %s\n", os.Args[1])
-	config, err := readConfig(os.Args[1])
-	if err != nil {
-		panic(err)
-	}
+	log.Println("Reading config at", os.Args[1])
+	config := readConfig(os.Args[1])
 
-	publicIp, err := getPublicIP(config.RecordType)
-	if err != nil {
-		panic(err)
-	}
-	fmt.Printf("Detected public ip address: %s\n", publicIp)
-
-	recordExists, err := checkRecordExists(config)
-	if err != nil {
-		panic(err)
-	}
-
-	if recordExists {
-		fmt.Println("Updating existing record")
-		err = updateRecord(config, publicIp)
-	} else {
-		fmt.Println("Creating new record")
-		err = createRecord(config, publicIp)
-	}
-
-	if err != nil {
-		panic(err)
-	}
+	processRecord(config, "A", &config.A)
+	processRecord(config, "AAAA", &config.AAAA)
 }
 
-func readConfig(configPath string) (*DynDnsConfig, error) {
+func readConfig(configPath string) *DynDnsConfig {
 	configFile, err := os.OpenFile(configPath, os.O_RDONLY, 0600)
 
 	defer func(configFile *os.File) {
@@ -61,33 +46,49 @@ func readConfig(configPath string) (*DynDnsConfig, error) {
 	}(configFile)
 
 	if err != nil {
-		return nil, err
+		log.Fatalln("could not open config file", err)
 	}
 
 	decoder := json.NewDecoder(configFile)
-	config := DynDnsConfig{}
+	config := &DynDnsConfig{
+		RecordTTL: 600,
+		A: RecordConfig{
+			Source: "https://ipv4.seeip.org",
+		},
+		AAAA: RecordConfig{
+			Source: "https://ipv6.seeip.org",
+		},
+	}
 
-	err = decoder.Decode(&config)
+	err = decoder.Decode(config)
 	if err != nil {
-		return nil, err
+		log.Fatalln("could not parse config file", err)
 	}
 
-	if config.RecordType != "AAAA" && config.RecordType != "A" {
-		return nil, fmt.Errorf("unknown record type %s", config.RecordType)
-	}
-
-	return &config, nil
+	return config
 }
 
-func getPublicIP(recordType string) (string, error) {
-	apiUrl := "https://ipv6.seeip.org"
-	if recordType == "A" {
-		apiUrl = "https://ipv4.seeip.org"
+func processRecord(config *DynDnsConfig, recordType string, recordConfig *RecordConfig) {
+	if !recordConfig.Enabled {
+		return
 	}
 
-	res, err := http.Get(apiUrl)
+	ipString := getPublicIP(recordConfig)
+	if parsedIp := net.ParseIP(ipString); parsedIp == nil || ((recordType == "A") == (parsedIp.To4() == nil)) {
+		log.Fatalf("service returned invalid ip address %s", ipString)
+	}
+
+	if checkRecordExists(config, recordType) {
+		updateRecord(config, recordType, ipString)
+	} else {
+		createRecord(config, recordType, ipString)
+	}
+}
+
+func getPublicIP(recordConfig *RecordConfig) string {
+	res, err := http.Get(recordConfig.Source)
 	if err != nil {
-		return "", err
+		log.Fatalf("could not fetch ip from %s %v\n", recordConfig.Source, err)
 	}
 	defer func(Body io.ReadCloser) {
 		_ = Body.Close()
@@ -95,10 +96,10 @@ func getPublicIP(recordType string) (string, error) {
 
 	ip, err := io.ReadAll(res.Body)
 	if err != nil {
-		return "", err
+		log.Fatalln("could not read response", err)
 	}
 
-	return string(ip), nil
+	return string(ip)
 }
 
 type rrSetPayload struct {
@@ -111,20 +112,25 @@ type rrSetRecord struct {
 	Value string `json:"value"`
 }
 
-func checkRecordExists(config *DynDnsConfig) (bool, error) {
-	endpoint := fmt.Sprintf("https://api.hetzner.cloud/v1/zones/%s/rrsets/%s/%s", config.ZoneName, config.RecordName, config.RecordType)
+func checkRecordExists(config *DynDnsConfig, recordType string) bool {
+	endpoint := fmt.Sprintf("https://api.hetzner.cloud/v1/zones/%s/rrsets/%s/%s", config.ZoneName, config.RecordName, recordType)
 
-	statusCode, err := do("GET", config.HetznerApiKey, endpoint, nil, []int{200, 404})
+	statusCode, err := doAuthenticated("GET", config.HetznerApiKey, endpoint, nil, []int{200, 404})
 
-	return statusCode == 200, err
+	if err != nil {
+		log.Fatalln("could not check record existence", err)
+	}
+
+	return statusCode == 200
 }
 
-func createRecord(config *DynDnsConfig, publicIp string) error {
+func createRecord(config *DynDnsConfig, recordType string, publicIp string) {
+	log.Printf("creating record of type %s with %s\n", recordType, publicIp)
 	endpoint := fmt.Sprintf("https://api.hetzner.cloud/v1/zones/%s/rrsets", config.ZoneName)
 
 	payload := &rrSetPayload{
 		Name: config.RecordName,
-		Type: config.RecordType,
+		Type: recordType,
 		TTL:  config.RecordTTL,
 		Records: []rrSetRecord{
 			{
@@ -133,12 +139,16 @@ func createRecord(config *DynDnsConfig, publicIp string) error {
 		},
 	}
 
-	_, err := do("POST", config.HetznerApiKey, endpoint, payload, []int{201})
-	return err
+	_, err := doAuthenticated("POST", config.HetznerApiKey, endpoint, payload, []int{201})
+
+	if err != nil {
+		log.Fatalf("could not create record of type %s with %s %v\n", recordType, publicIp, err)
+	}
 }
 
-func updateRecord(config *DynDnsConfig, publicIp string) error {
-	endpoint := fmt.Sprintf("https://api.hetzner.cloud/v1/zones/%s/rrsets/%s/%s/actions/set_records", config.ZoneName, config.RecordName, config.RecordType)
+func updateRecord(config *DynDnsConfig, recordType string, publicIp string) {
+	log.Printf("updating record of type %s to %s\n", recordType, publicIp)
+	endpoint := fmt.Sprintf("https://api.hetzner.cloud/v1/zones/%s/rrsets/%s/%s/actions/set_records", config.ZoneName, config.RecordName, recordType)
 
 	payload := &rrSetPayload{
 		Records: []rrSetRecord{
@@ -148,11 +158,14 @@ func updateRecord(config *DynDnsConfig, publicIp string) error {
 		},
 	}
 
-	_, err := do("POST", config.HetznerApiKey, endpoint, payload, []int{201})
-	return err
+	_, err := doAuthenticated("POST", config.HetznerApiKey, endpoint, payload, []int{201})
+
+	if err != nil {
+		log.Fatalf("could not update record of type %s to %s %v", recordType, publicIp, err)
+	}
 }
 
-func do(method string, apiKey string, url string, payload *rrSetPayload, expectedStatusCodes []int) (int, error) {
+func doAuthenticated(method string, apiKey string, url string, payload *rrSetPayload, expectedStatusCodes []int) (int, error) {
 	var body io.Reader = http.NoBody
 
 	if payload != nil {
