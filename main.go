@@ -27,12 +27,13 @@ type RecordConfig struct {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("config file not provided")
-		return
+	configPath := "dyndns.json"
+	if len(os.Args) >= 2 {
+		configPath = os.Args[1]
 	}
-	log.Println("Reading config at", os.Args[1])
-	config := readConfig(os.Args[1])
+
+	log.Println("using config at", configPath)
+	config := readConfig(configPath)
 
 	processRecord(config, "A", &config.A)
 	processRecord(config, "AAAA", &config.AAAA)
