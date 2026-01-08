@@ -74,14 +74,19 @@ func processRecord(config *DynDnsConfig, recordType string, recordConfig *Record
 	}
 
 	ipString := getPublicIP(recordConfig)
-	if parsedIp := net.ParseIP(ipString); parsedIp == nil || ((recordType == "A") == (parsedIp.To4() == nil)) {
+	parsedIp := net.ParseIP(ipString)
+	if parsedIp == nil || ((recordType == "A") == (parsedIp.To4() == nil)) {
 		log.Fatalf("service returned invalid ip address %s", ipString)
 	}
 
-	if checkRecordExists(config, recordType) {
-		updateRecord(config, recordType, ipString)
-	} else {
+	if currentAddress := getCurrentRecord(config, recordType); currentAddress == "" {
 		createRecord(config, recordType, ipString)
+	} else {
+		if parsedIp.Equal(net.ParseIP(currentAddress)) {
+			log.Println("Skipping update because address is already up-to-date")
+		} else {
+			updateRecord(config, recordType, ipString)
+		}
 	}
 }
 
@@ -102,6 +107,10 @@ func getPublicIP(recordConfig *RecordConfig) string {
 	return string(ip)
 }
 
+type rrSetResponse struct {
+	RRSet rrSetPayload `json:"rrset"`
+}
+
 type rrSetPayload struct {
 	Name    string        `json:"name,omitempty"`
 	Type    string        `json:"type,omitempty"`
@@ -112,16 +121,28 @@ type rrSetRecord struct {
 	Value string `json:"value"`
 }
 
-func checkRecordExists(config *DynDnsConfig, recordType string) bool {
+func getCurrentRecord(config *DynDnsConfig, recordType string) string {
 	endpoint := fmt.Sprintf("https://api.hetzner.cloud/v1/zones/%s/rrsets/%s/%s", config.ZoneName, config.RecordName, recordType)
 
-	statusCode, err := doAuthenticated("GET", config.HetznerApiKey, endpoint, nil, []int{200, 404})
+	statusCode, body, err := doAuthenticated("GET", config.HetznerApiKey, endpoint, nil, []int{200, 404}, true)
 
 	if err != nil {
 		log.Fatalln("could not check record existence", err)
+	} else if statusCode == 404 {
+		return ""
 	}
 
-	return statusCode == 200
+	parsedResponse := rrSetResponse{}
+	err = json.Unmarshal(body, &parsedResponse)
+	if err != nil {
+		log.Fatalf("could not parse api response %s %v\n", body, err)
+	}
+
+	for _, record := range parsedResponse.RRSet.Records {
+		return record.Value
+	}
+
+	return ""
 }
 
 func createRecord(config *DynDnsConfig, recordType string, publicIp string) {
@@ -139,7 +160,7 @@ func createRecord(config *DynDnsConfig, recordType string, publicIp string) {
 		},
 	}
 
-	_, err := doAuthenticated("POST", config.HetznerApiKey, endpoint, payload, []int{201})
+	_, _, err := doAuthenticated("POST", config.HetznerApiKey, endpoint, payload, []int{201}, false)
 
 	if err != nil {
 		log.Fatalf("could not create record of type %s with %s %v\n", recordType, publicIp, err)
@@ -158,43 +179,53 @@ func updateRecord(config *DynDnsConfig, recordType string, publicIp string) {
 		},
 	}
 
-	_, err := doAuthenticated("POST", config.HetznerApiKey, endpoint, payload, []int{201})
+	_, _, err := doAuthenticated("POST", config.HetznerApiKey, endpoint, payload, []int{201}, false)
 
 	if err != nil {
 		log.Fatalf("could not update record of type %s to %s %v", recordType, publicIp, err)
 	}
 }
 
-func doAuthenticated(method string, apiKey string, url string, payload *rrSetPayload, expectedStatusCodes []int) (int, error) {
+func doAuthenticated(method string, apiKey string, url string, payload *rrSetPayload, expectedStatusCodes []int, readBody bool) (int, []byte, error) {
 	var body io.Reader = http.NoBody
 
 	if payload != nil {
 		encodedPayload, err := json.Marshal(payload)
 		if err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 		body = bytes.NewBuffer(encodedPayload)
 	}
 
 	req, err := http.NewRequest(method, url, body)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiKey))
 
 	response, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	defer func(Body io.ReadCloser) {
-		_ = Body.Close()
+		err := Body.Close()
+		if err != nil {
+			log.Println("could not properly close response body", err)
+		}
 	}(response.Body)
 
 	if !slices.Contains(expectedStatusCodes, response.StatusCode) {
-		body, _ := io.ReadAll(response.Body)
-		return 0, fmt.Errorf("unexpected api response %d %s", response.StatusCode, string(body))
+		responseBody, _ := io.ReadAll(response.Body)
+		return 0, nil, fmt.Errorf("unexpected api response %d %s", response.StatusCode, string(responseBody))
+	}
+	if readBody {
+		responseBody, err := io.ReadAll(response.Body)
+		if err != nil {
+			return 0, nil, err
+		}
+		return response.StatusCode, responseBody, nil
 	}
 
-	return response.StatusCode, nil
+	return response.StatusCode, nil, nil
 }
