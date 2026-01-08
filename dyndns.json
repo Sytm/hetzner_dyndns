@@ -1,0 +1,12 @@
+{
+  "HetznerApiKey": "<HETZNER_CLOUD_API_KEY>",
+  "ZoneName": "example.de",
+  "RecordName": "homelab",
+  "RecordTTL": 600,
+  "AAAA": {
+    "Enabled": true
+  },
+  "A": {
+    "Enabled": false
+  }
+}
