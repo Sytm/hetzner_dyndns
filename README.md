@@ -9,9 +9,16 @@ Sample `dyndns.json` (the actual config does not support comments)
 ```json5
 {
   "HetznerApiKey": "<HETZNER_CLOUD_API_KEY>",
-  "ZoneName": "example.de",
-  "RecordName": "homelab",
   "RecordTTL": 300,
+  "Zones": {
+    "example.de": [
+      "service1",
+      "service2"
+    ],
+    "alternative.de": [
+      "backup.homelab"
+    ]
+  },
   "AAAA": {
     "Enabled": true,
 //    "Source": "https://ipv6.seeip.org"
@@ -26,5 +33,5 @@ It is recommended to change the file permissions of `dyndns.json` to `0600` to p
 
 Example crontab entry that checks and if needed updates the address every 10 minutes (given that both files are in the `/root` directory):
 ```cronexp
-*/10 * * * * /root/hetzner_dyndns /root/dyndns.json
+*/10 * * * * /root/dyndns /root/dyndns.json
 ```

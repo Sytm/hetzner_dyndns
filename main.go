@@ -14,9 +14,8 @@ import (
 
 type DynDnsConfig struct {
 	HetznerApiKey string
-	ZoneName      string
-	RecordName    string
 	RecordTTL     int
+	Zones         map[string][]string
 	A             RecordConfig
 	AAAA          RecordConfig
 }
@@ -52,7 +51,7 @@ func readConfig(configPath string) *DynDnsConfig {
 
 	decoder := json.NewDecoder(configFile)
 	config := &DynDnsConfig{
-		RecordTTL: 600,
+		RecordTTL: 300,
 		A: RecordConfig{
 			Source: "https://ipv4.seeip.org",
 		},
@@ -80,13 +79,17 @@ func processRecord(config *DynDnsConfig, recordType string, recordConfig *Record
 		log.Fatalf("service returned invalid ip address %s", ipString)
 	}
 
-	if currentAddress := getCurrentRecord(config, recordType); currentAddress == "" {
-		createRecord(config, recordType, ipString)
-	} else {
-		if parsedIp.Equal(net.ParseIP(currentAddress)) {
-			log.Println("Skipping update because address is already up-to-date")
-		} else {
-			updateRecord(config, recordType, ipString)
+	for zoneName, recordNames := range config.Zones {
+		for _, recordName := range recordNames {
+			if currentAddress := getCurrentRecord(config, zoneName, recordName, recordType); currentAddress == "" {
+				createRecord(config, zoneName, recordName, recordType, ipString)
+			} else {
+				if parsedIp.Equal(net.ParseIP(currentAddress)) {
+					log.Printf("Skipping update of %s.%s with type %s because address is already up-to-date", recordName, zoneName, recordType)
+				} else {
+					updateRecord(config, zoneName, recordName, recordType, ipString)
+				}
+			}
 		}
 	}
 }
@@ -122,8 +125,8 @@ type rrSetRecord struct {
 	Value string `json:"value"`
 }
 
-func getCurrentRecord(config *DynDnsConfig, recordType string) string {
-	endpoint := fmt.Sprintf("https://api.hetzner.cloud/v1/zones/%s/rrsets/%s/%s", config.ZoneName, config.RecordName, recordType)
+func getCurrentRecord(config *DynDnsConfig, zoneName string, recordName string, recordType string) string {
+	endpoint := fmt.Sprintf("https://api.hetzner.cloud/v1/zones/%s/rrsets/%s/%s", zoneName, recordName, recordType)
 
 	statusCode, body, err := doAuthenticated("GET", config.HetznerApiKey, endpoint, nil, []int{200, 404}, true)
 
@@ -146,12 +149,12 @@ func getCurrentRecord(config *DynDnsConfig, recordType string) string {
 	return ""
 }
 
-func createRecord(config *DynDnsConfig, recordType string, publicIp string) {
-	log.Printf("creating record of type %s with %s\n", recordType, publicIp)
-	endpoint := fmt.Sprintf("https://api.hetzner.cloud/v1/zones/%s/rrsets", config.ZoneName)
+func createRecord(config *DynDnsConfig, zoneName string, recordName string, recordType string, publicIp string) {
+	log.Printf("creating record %s.%s of type %s with %s\n", recordName, zoneName, recordType, publicIp)
+	endpoint := fmt.Sprintf("https://api.hetzner.cloud/v1/zones/%s/rrsets", zoneName)
 
 	payload := &rrSetPayload{
-		Name: config.RecordName,
+		Name: recordName,
 		Type: recordType,
 		TTL:  config.RecordTTL,
 		Records: []rrSetRecord{
@@ -164,13 +167,13 @@ func createRecord(config *DynDnsConfig, recordType string, publicIp string) {
 	_, _, err := doAuthenticated("POST", config.HetznerApiKey, endpoint, payload, []int{201}, false)
 
 	if err != nil {
-		log.Fatalf("could not create record of type %s with %s %v\n", recordType, publicIp, err)
+		log.Fatalf("could not create record %s.%s of type %s with %s %v\n", recordName, zoneName, recordType, publicIp, err)
 	}
 }
 
-func updateRecord(config *DynDnsConfig, recordType string, publicIp string) {
-	log.Printf("updating record of type %s to %s\n", recordType, publicIp)
-	endpoint := fmt.Sprintf("https://api.hetzner.cloud/v1/zones/%s/rrsets/%s/%s/actions/set_records", config.ZoneName, config.RecordName, recordType)
+func updateRecord(config *DynDnsConfig, zoneName string, recordName string, recordType string, publicIp string) {
+	log.Printf("updating record %s.%s of type %s with %s\n", recordName, zoneName, recordType, publicIp)
+	endpoint := fmt.Sprintf("https://api.hetzner.cloud/v1/zones/%s/rrsets/%s/%s/actions/set_records", zoneName, recordName, recordType)
 
 	payload := &rrSetPayload{
 		Records: []rrSetRecord{
@@ -183,7 +186,7 @@ func updateRecord(config *DynDnsConfig, recordType string, publicIp string) {
 	_, _, err := doAuthenticated("POST", config.HetznerApiKey, endpoint, payload, []int{201}, false)
 
 	if err != nil {
-		log.Fatalf("could not update record of type %s to %s %v", recordType, publicIp, err)
+		log.Fatalf("could not update record %s.%s of type %s with %s %v\n", recordName, zoneName, recordType, publicIp, err)
 	}
 }
 
