@@ -42,7 +42,10 @@ func readConfig(configPath string) *DynDnsConfig {
 	configFile, err := os.OpenFile(configPath, os.O_RDONLY, 0600)
 
 	defer func(configFile *os.File) {
-		_ = configFile.Close()
+		err := configFile.Close()
+		if err != nil {
+			log.Println("could not properly close config file", err)
+		}
 	}(configFile)
 
 	if err != nil {
